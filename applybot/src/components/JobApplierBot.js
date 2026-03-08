@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { GLOBAL_STYLES } from "../styles/theme";
 import MOCK_JOBS from "../data/jobs";
-import { analyzeResume, matchResumeToJob, enhanceResumeForJob, generateCoverLetter } from "../api/claude";
+import { analyzeResume, matchResumeToJob, enhanceResumeForJob, generateCoverLetter, extractJobKeywords } from "../api/claude";
+import { fetchJobsFromAPI, extractKeywords } from "../api/jobs";
 import Dashboard from "./Dashboard";
 import JobBoard from "./JobBoard";
 import AIEnhancer from "./AIEnhancer";
@@ -19,6 +20,7 @@ export default function JobApplierBot() {
   const [loadingMatch, setLoadingMatch] = useState(false);
   const [loadingEnhance, setLoadingEnhance] = useState(false);
   const [loadingApply, setLoadingApply] = useState(false);
+  const [loadingJobs, setLoadingJobs] = useState(false);
   const [analysisResult, setAnalysisResult] = useState("");
   const [loadingAnalysis, setLoadingAnalysis] = useState(false);
   const [toast, setToast] = useState(null);
@@ -37,27 +39,59 @@ export default function JobApplierBot() {
       const result = await analyzeResume(resume);
       setAnalysisResult(result);
     } catch (e) {
-      showToast(e.message || "Analysis failed. Try again.", "error");
+      showToast(e.message || "Analysis failed.", "error");
     }
     setLoadingAnalysis(false);
+  }
+
+  async function handleFetchJobs() {
+    if (!resume) return showToast("Please upload your resume first.", "error");
+    setLoadingJobs(true);
+    showToast("Finding relevant jobs for your resume...", "success");
+    try {
+      // Extract keywords from resume using AI first, fallback to simple parsing
+      let keywords = extractKeywords(resume);
+      try {
+        const aiKeywords = await extractJobKeywords(resume);
+        if (aiKeywords.length > 0) keywords = aiKeywords;
+      } catch {
+        // use simple keywords as fallback
+      }
+
+      const fetchedJobs = await fetchJobsFromAPI(keywords);
+      if (fetchedJobs.length > 0) {
+        setJobs(fetchedJobs);
+        showToast(`Found ${fetchedJobs.length} relevant jobs for your profile!`);
+      } else {
+        showToast("No jobs found. Showing default listings.", "error");
+        setJobs(MOCK_JOBS);
+      }
+    } catch (e) {
+      showToast("Could not fetch jobs. Showing defaults.", "error");
+      setJobs(MOCK_JOBS);
+    }
+    setLoadingJobs(false);
   }
 
   async function handleMatchAll() {
     if (!resume) return showToast("Please upload your resume first.", "error");
     setLoadingMatch(true);
+    showToast("Scoring all jobs against your resume...");
     try {
       const updated = await Promise.all(
         jobs.map(async (job) => {
           try {
-            const { score, reason } = await matchResumeToJob(resume, job);
-            return { ...job, match: score, matchReason: reason };
+            const { score, reason, missingSkills } = await matchResumeToJob(resume, job);
+            return { ...job, match: score, matchReason: reason, missingSkills };
           } catch {
-            return { ...job, match: Math.floor(Math.random() * 40 + 50) };
+            return { ...job, match: null };
           }
         })
       );
+      // Sort by match score descending
+      updated.sort((a, b) => (b.match || 0) - (a.match || 0));
       setJobs(updated);
-      showToast("Job matching complete!");
+      showToast("Job matching complete! Sorted by best match.");
     } catch (e) {
       showToast("Matching failed.", "error");
     }
@@ -86,7 +120,7 @@ export default function JobApplierBot() {
   async function handleApplySubmit() {
     if (!selectedJob) return;
     setLoadingApply(true);
-    await new Promise((r) => setTimeout(r, 2000)); // Simulated submission delay
+    await new Promise((r) => setTimeout(r, 2000));
     setJobs((prev) =>
       prev.map((j) =>
         j.id === selectedJob.id
@@ -147,7 +181,9 @@ export default function JobApplierBot() {
             analysisResult={analysisResult}
             loadingAnalysis={loadingAnalysis}
             loadingMatch={loadingMatch}
+            loadingJobs={loadingJobs}
             onAnalyze={handleAnalyze}
+            onFetchJobs={handleFetchJobs}
             onMatchAll={handleMatchAll}
             onApply={openApplyPanel}
             showToast={showToast}
@@ -157,6 +193,10 @@ export default function JobApplierBot() {
           <JobBoard
             jobs={jobs}
             resume={resume}
+            loadingJobs={loadingJobs}
+            loadingMatch={loadingMatch}
+            onFetchJobs={handleFetchJobs}
+            onMatchAll={handleMatchAll}
             onApply={openApplyPanel}
             onEnhance={openEnhancer}
           />
