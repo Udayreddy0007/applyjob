@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { GLOBAL_STYLES } from "../styles/theme";
-import MOCK_JOBS from "../data/jobs";
 import { analyzeResume, matchResumeToJob, enhanceResumeForJob, generateCoverLetter, extractJobKeywords } from "../api/claude";
 import { fetchJobsFromAPI, extractKeywords } from "../api/jobs";
 import Dashboard from "./Dashboard";
@@ -13,7 +12,8 @@ export default function JobApplierBot() {
   const [tab, setTab] = useState("dashboard");
   const [resume, setResume] = useState("");
   const [resumeFile, setResumeFile] = useState(null);
-  const [jobs, setJobs] = useState(MOCK_JOBS);
+  const [jobs, setJobs] = useState([]);
+  const [applications, setApplications] = useState([]); // persistent tracker
   const [selectedJob, setSelectedJob] = useState(null);
   const [enhancedResume, setEnhancedResume] = useState("");
   const [coverLetter, setCoverLetter] = useState("");
@@ -25,10 +25,11 @@ export default function JobApplierBot() {
   const [loadingAnalysis, setLoadingAnalysis] = useState(false);
   const [toast, setToast] = useState(null);
   const [applyPanel, setApplyPanel] = useState(false);
+  const [autoApplying, setAutoApplying] = useState(false);
 
   function showToast(msg, type = "success") {
     setToast({ msg, type });
-    setTimeout(() => setToast(null), 3500);
+    setTimeout(() => setToast(null), 4000);
   }
 
   async function handleAnalyze() {
@@ -47,51 +48,62 @@ export default function JobApplierBot() {
   async function handleFetchJobs() {
     if (!resume) return showToast("Please upload your resume first.", "error");
     setLoadingJobs(true);
-    showToast("Finding relevant jobs for your resume...", "success");
+    setJobs([]);
+    showToast("Extracting your profile from resume...");
     try {
-      // Extract keywords from resume using AI first, fallback to simple parsing
-      let keywords = extractKeywords(resume);
+      // Use AI to extract exact role, fallback to simple keywords
+      let resumeData = { primaryRole: "software engineer", keywords: [], experienceLevel: "junior" };
       try {
-        const aiKeywords = await extractJobKeywords(resume);
-        if (aiKeywords.length > 0) keywords = aiKeywords;
+        const extracted = await extractJobKeywords(resume);
+        resumeData = extracted;
+        showToast(`Finding "${extracted.primaryRole}" jobs across 15 portals...`);
       } catch {
-        // use simple keywords as fallback
+        const kws = extractKeywords(resume);
+        resumeData.keywords = kws;
+        resumeData.primaryRole = kws[0] || "software engineer";
+        showToast(`Finding jobs for your profile across 15 portals...`);
       }
 
-      const fetchedJobs = await fetchJobsFromAPI(keywords);
+      const fetchedJobs = await fetchJobsFromAPI(resumeData);
+
       if (fetchedJobs.length > 0) {
-        setJobs(fetchedJobs);
-        showToast(`Found ${fetchedJobs.length} relevant jobs for your profile!`);
+        // Preserve applied status from existing jobs
+        const updatedJobs = fetchedJobs.map((j) => {
+          const existing = jobs.find((ej) => ej.id === j.id);
+          return existing ? { ...j, applied: existing.applied, appliedAt: existing.appliedAt, status: existing.status } : j;
+        });
+        setJobs(updatedJobs);
+        showToast(`✅ Found ${fetchedJobs.length} jobs matching your profile!`);
       } else {
-        showToast("No jobs found. Showing default listings.", "error");
-        setJobs(MOCK_JOBS);
+        showToast("No jobs found. Try again in a moment.", "error");
       }
     } catch (e) {
-      showToast("Could not fetch jobs. Showing defaults.", "error");
-      setJobs(MOCK_JOBS);
+      showToast("Could not fetch jobs. Try again.", "error");
     }
     setLoadingJobs(false);
   }
 
   async function handleMatchAll() {
     if (!resume) return showToast("Please upload your resume first.", "error");
+    if (jobs.length === 0) return showToast("Fetch jobs first.", "error");
     setLoadingMatch(true);
-    showToast("Scoring all jobs against your resume...");
+    showToast(`Scoring ${jobs.length} jobs against your resume...`);
     try {
       const updated = await Promise.all(
         jobs.map(async (job) => {
           try {
-            const { score, reason, missingSkills } = await matchResumeToJob(resume, job);
-            return { ...job, match: score, matchReason: reason, missingSkills };
+            const { score, reason, missingSkills, matchingSkills } = await matchResumeToJob(resume, job);
+            return { ...job, match: score, matchReason: reason, missingSkills: missingSkills || [], matchingSkills: matchingSkills || [] };
           } catch {
             return { ...job, match: null };
           }
         })
       );
-      // Sort by match score descending
+      // Sort by match score
       updated.sort((a, b) => (b.match || 0) - (a.match || 0));
       setJobs(updated);
-      showToast("Job matching complete! Sorted by best match.");
+      const topScore = updated[0]?.match || 0;
+      showToast(`✅ Scored ${updated.length} jobs! Top match: ${topScore}%`);
     } catch (e) {
       showToast("Matching failed.", "error");
     }
@@ -103,34 +115,86 @@ export default function JobApplierBot() {
     setLoadingEnhance(true);
     setEnhancedResume("");
     setCoverLetter("");
+    showToast(`Enhancing resume for ${job.title}...`);
     try {
       const [enhanced, cover] = await Promise.all([
         enhanceResumeForJob(resume, job),
         generateCoverLetter(resume, job),
       ]);
+      if (!enhanced || enhanced.trim().length < 100) {
+        throw new Error("Enhancement returned empty result. Please try again.");
+      }
       setEnhancedResume(enhanced);
       setCoverLetter(cover);
-      showToast("Resume enhanced & cover letter generated!");
+      showToast("✅ Resume enhanced & cover letter generated!");
     } catch (e) {
-      showToast(e.message || "Enhancement failed.", "error");
+      showToast(e.message || "Enhancement failed. Try again.", "error");
     }
     setLoadingEnhance(false);
   }
 
-  async function handleApplySubmit() {
-    if (!selectedJob) return;
+  // Auto-apply: open job URL + mark as applied
+  async function handleAutoApply(job, resumeToUse, coverLetterToUse) {
     setLoadingApply(true);
-    await new Promise((r) => setTimeout(r, 2000));
-    setJobs((prev) =>
-      prev.map((j) =>
-        j.id === selectedJob.id
-          ? { ...j, applied: true, status: "Applied", appliedAt: new Date().toLocaleString() }
-          : j
-      )
-    );
+    showToast(`Auto-applying to ${job.title}...`);
+
+    // Open job URL in new tab
+    if (job.url) {
+      window.open(job.url, "_blank");
+    }
+
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const application = {
+      id: job.id,
+      jobTitle: job.title,
+      company: job.company,
+      portal: job.portal,
+      portalColor: job.portalColor,
+      location: job.location,
+      salary: job.salary,
+      url: job.url,
+      match: job.match,
+      status: "Applied",
+      appliedAt: new Date().toLocaleString(),
+      resumeUsed: resumeToUse || resume,
+      coverLetterUsed: coverLetterToUse || "",
+    };
+
+    // Add to applications tracker
+    setApplications((prev) => {
+      const exists = prev.find((a) => a.id === job.id);
+      if (exists) return prev.map((a) => a.id === job.id ? application : a);
+      return [application, ...prev];
+    });
+
+    // Mark job as applied in jobs list
+    setJobs((prev) => prev.map((j) =>
+      j.id === job.id ? { ...j, applied: true, status: "Applied", appliedAt: application.appliedAt } : j
+    ));
+
     setApplyPanel(false);
-    showToast(`✅ Applied to ${selectedJob.title} at ${selectedJob.company}!`);
     setLoadingApply(false);
+    showToast(`✅ Applied to ${job.title} at ${job.company}! Job page opened.`);
+    setTab("tracker");
+  }
+
+  // Auto-apply to all top matching jobs
+  async function handleAutoApplyAll() {
+    const topJobs = jobs.filter((j) => j.match >= 60 && !j.applied).slice(0, 5);
+    if (topJobs.length === 0) return showToast("No jobs with 60%+ match found. Score jobs first.", "error");
+
+    setAutoApplying(true);
+    showToast(`Auto-applying to ${topJobs.length} top matching jobs...`);
+
+    for (const job of topJobs) {
+      await handleAutoApply(job, enhancedResume || resume, coverLetter);
+      await new Promise((r) => setTimeout(r, 800));
+    }
+
+    setAutoApplying(false);
+    showToast(`✅ Applied to ${topJobs.length} jobs! Check the Tracker tab.`);
+    setTab("tracker");
   }
 
   function openApplyPanel(job) {
@@ -150,34 +214,58 @@ export default function JobApplierBot() {
       <style>{GLOBAL_STYLES}</style>
 
       {/* HEADER */}
-      <div style={{ padding: "20px 30px", borderBottom: "1px solid #1e293b", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#080c14" }}>
+      <div style={{ padding: "16px 30px", borderBottom: "1px solid #1e293b", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <div style={{ width: "34px", height: "34px", background: "linear-gradient(135deg, #38bdf8, #818cf8)", borderRadius: "8px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px" }}>⚡</div>
           <div>
-            <div style={{ fontFamily: "'Syne', sans-serif", fontSize: "17px", fontWeight: "800", color: "#f1f5f9", letterSpacing: "-0.02em" }}>ApplyBot</div>
+            <div style={{ fontFamily: "'Syne', sans-serif", fontSize: "17px", fontWeight: "800", color: "#f1f5f9" }}>ApplyBot</div>
             <div style={{ fontSize: "10px", color: "#475569", letterSpacing: "0.1em", textTransform: "uppercase" }}>AI Job Application System</div>
           </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: resume ? "#22c55e" : "#475569" }} className={resume ? "pulse" : ""} />
-          <span style={{ fontSize: "11px", color: resume ? "#4ade80" : "#475569" }}>{resume ? "Resume Active" : "No Resume"}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {applications.length > 0 && (
+            <div style={{ fontSize: "11px", color: "#4ade80", background: "#064e3b", border: "1px solid #166534", padding: "4px 12px", borderRadius: "20px" }}>
+              {applications.length} Applied
+            </div>
+          )}
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: resume ? "#22c55e" : "#475569" }} className={resume ? "pulse" : ""} />
+            <span style={{ fontSize: "11px", color: resume ? "#4ade80" : "#475569" }}>{resume ? "Resume Active" : "No Resume"}</span>
+          </div>
         </div>
       </div>
 
       {/* TABS */}
-      <div style={{ borderBottom: "1px solid #1e293b", display: "flex", padding: "0 20px", background: "#080c14" }}>
-        {[["dashboard", "⬡ Dashboard"], ["jobs", "⬡ Job Board"], ["enhance", "⬡ AI Enhancer"], ["tracker", "⬡ Applications"]].map(([id, label]) => (
+      <div style={{ borderBottom: "1px solid #1e293b", display: "flex", padding: "0 20px" }}>
+        {[
+          ["dashboard", "⬡ Dashboard"],
+          ["jobs", "⬡ Job Board"],
+          ["enhance", "⬡ AI Enhancer"],
+          ["tracker", `⬡ Tracker ${applications.length > 0 ? `(${applications.length})` : ""}`],
+        ].map(([id, label]) => (
           <button key={id} className={`tab-btn${tab === id ? " active" : ""}`} onClick={() => setTab(id)}>{label}</button>
         ))}
       </div>
 
-      {/* PAGE CONTENT */}
+      {/* AUTO APPLY BANNER */}
+      {jobs.filter((j) => j.match >= 60 && !j.applied).length > 0 && (
+        <div style={{ background: "#0d1f35", borderBottom: "1px solid #1e3f5a", padding: "10px 30px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={{ fontSize: "12px", color: "#7dd3fc" }}>
+            ⬡ {jobs.filter((j) => j.match >= 60 && !j.applied).length} jobs with 60%+ match ready to auto-apply
+          </span>
+          <button className="btn btn-success" style={{ padding: "6px 16px", fontSize: "12px" }} onClick={handleAutoApplyAll} disabled={autoApplying}>
+            {autoApplying ? <><span className="spinner" /> Auto-Applying...</> : "⚡ Auto Apply All"}
+          </button>
+        </div>
+      )}
+
+      {/* CONTENT */}
       <div style={{ flex: 1, padding: "24px 30px", overflow: "auto" }}>
         {tab === "dashboard" && (
           <Dashboard
             resume={resume} setResume={setResume}
             resumeFile={resumeFile} setResumeFile={setResumeFile}
-            jobs={jobs}
+            jobs={jobs} applications={applications}
             analysisResult={analysisResult}
             loadingAnalysis={loadingAnalysis}
             loadingMatch={loadingMatch}
@@ -186,52 +274,43 @@ export default function JobApplierBot() {
             onFetchJobs={handleFetchJobs}
             onMatchAll={handleMatchAll}
             onApply={openApplyPanel}
+            onAutoApplyAll={handleAutoApplyAll}
+            autoApplying={autoApplying}
             showToast={showToast}
           />
         )}
         {tab === "jobs" && (
           <JobBoard
-            jobs={jobs}
-            resume={resume}
-            loadingJobs={loadingJobs}
-            loadingMatch={loadingMatch}
-            onFetchJobs={handleFetchJobs}
-            onMatchAll={handleMatchAll}
-            onApply={openApplyPanel}
-            onEnhance={openEnhancer}
+            jobs={jobs} resume={resume}
+            loadingJobs={loadingJobs} loadingMatch={loadingMatch}
+            onFetchJobs={handleFetchJobs} onMatchAll={handleMatchAll}
+            onApply={openApplyPanel} onEnhance={openEnhancer}
           />
         )}
         {tab === "enhance" && (
           <AIEnhancer
-            jobs={jobs}
-            resume={resume}
-            selectedJob={selectedJob}
-            setSelectedJob={setSelectedJob}
-            enhancedResume={enhancedResume}
-            setEnhancedResume={setEnhancedResume}
-            coverLetter={coverLetter}
-            setCoverLetter={setCoverLetter}
+            jobs={jobs} resume={resume}
+            selectedJob={selectedJob} setSelectedJob={setSelectedJob}
+            enhancedResume={enhancedResume} setEnhancedResume={setEnhancedResume}
+            coverLetter={coverLetter} setCoverLetter={setCoverLetter}
             loadingEnhance={loadingEnhance}
-            onEnhance={handleEnhance}
-            onApply={openApplyPanel}
+            onEnhance={handleEnhance} onApply={openApplyPanel}
           />
         )}
         {tab === "tracker" && (
-          <Tracker jobs={jobs} onBrowse={() => setTab("jobs")} />
+          <Tracker applications={applications} setApplications={setApplications} onBrowse={() => setTab("jobs")} />
         )}
       </div>
 
       {/* APPLY PANEL */}
       {applyPanel && selectedJob && (
         <ApplyPanel
-          job={selectedJob}
-          resume={resume}
-          enhancedResume={enhancedResume}
-          setEnhancedResume={setEnhancedResume}
-          coverLetter={coverLetter}
-          setCoverLetter={setCoverLetter}
+          job={selectedJob} resume={resume}
+          enhancedResume={enhancedResume} setEnhancedResume={setEnhancedResume}
+          coverLetter={coverLetter} setCoverLetter={setCoverLetter}
           loadingApply={loadingApply}
-          onSubmit={handleApplySubmit}
+          onSubmit={() => handleAutoApply(selectedJob, enhancedResume || resume, coverLetter)}
+          onEnhance={() => { setApplyPanel(false); openEnhancer(selectedJob); }}
           onClose={() => setApplyPanel(false)}
         />
       )}
